@@ -129,7 +129,7 @@ export function createSeedData(): CenterData {
   });
 
   return {
-    version: 8,
+    version: 1,
     teachers,
     students,
     payments,

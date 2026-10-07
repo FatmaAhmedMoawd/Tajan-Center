@@ -117,3 +117,24 @@ export function getMonthOptions(): { value: string; label: string }[] {
 
   return academicMonths;
 }
+
+export function formatTimeAr(date: Date | string | null | undefined): string {
+  if (!date) return '';
+  const d = typeof date === 'string' ? new Date(date) : date;
+  if (isNaN(d.getTime())) return '';
+  return d.toLocaleTimeString('ar-EG', {
+    hour: '2-digit',
+    minute: '2-digit',
+    second: '2-digit',
+    hour12: true,
+  });
+}
+
+export function formatBytesAr(bytes: number): string {
+  if (bytes === 0) return '0 بايت';
+  if (bytes < 1024) return `${bytes} بايت`;
+  const kb = bytes / 1024;
+  if (kb < 1024) return `${kb.toFixed(1)} كيلوبايت`;
+  const mb = kb / 1024;
+  return `${mb.toFixed(2)} ميجابايت`;
+}

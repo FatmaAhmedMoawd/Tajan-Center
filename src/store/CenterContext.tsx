@@ -1,4 +1,13 @@
-import React, { createContext, useContext, useEffect, useState, useCallback } from 'react';
+'use client';
+
+import React, {
+  createContext,
+  useContext,
+  useEffect,
+  useState,
+  useCallback,
+  useRef,
+} from 'react';
 import {
   CenterData,
   PaymentRecord,
@@ -8,14 +17,22 @@ import {
 } from '../types';
 import {
   createEmptyData,
-  getInitialData,
-  saveData,
+  loadDataFromStorage,
+  saveDataToStorage,
+  clearAllStorageData,
+  restoreSeedData,
+  STORAGE_KEY,
 } from '../lib/storage';
-import { createSeedData } from '../lib/seed';
-import { generateId, getDefaultAppMonth, getTodayDateString, getMonthOptions } from '../lib/utils';
+import {
+  generateId,
+  getDefaultAppMonth,
+  getTodayDateString,
+  getMonthOptions,
+} from '../lib/utils';
 import { getDefaultFeeForGrade } from '../lib/constants';
 
 export type ActiveNavTab = 'overview' | 'teacher' | 'stats' | 'settings';
+export type SaveStatus = 'idle' | 'saving' | 'saved' | 'error';
 
 interface CenterContextType {
   data: CenterData;
@@ -27,6 +44,12 @@ interface CenterContextType {
   activeTeacherId: string | null;
   setActiveTeacherId: (id: string | null) => void;
   openTeacherView: (teacherId: string) => void;
+
+  // Save tracking and diagnostics
+  lastSavedAt: Date | null;
+  saveStatus: SaveStatus;
+  saveError: string | null;
+  forceSave: () => void;
 
   // Teacher actions
   addTeacher: (teacher: Omit<Teacher, 'id'>) => Teacher;
@@ -67,61 +90,183 @@ interface CenterContextType {
 const CenterContext = createContext<CenterContextType | null>(null);
 
 export const CenterProvider: React.FC<{ children: React.ReactNode }> = ({ children }) => {
-  const [data, setData] = useState<CenterData>(getInitialData);
+  // حالة البيانات تبدأ بكائن فارغ آمن حتى يكتمل التحميل
+  const [data, setData] = useState<CenterData>(createEmptyData);
+  // Rule #1: isHydrated تبدأ بـ false صراحةً، وممنوع الحفظ طالما هي false
   const [isHydrated, setIsHydrated] = useState(false);
-  // Default opening month is strictly September (شهر 9) as requested
+  const isHydratedRef = useRef(false);
+
+  // مرجع للبيانات الحالية للوصول إليها في أحداث visibilitychange و pagehide
+  const dataRef = useRef<CenterData>(data);
+  dataRef.current = data;
+
+  // مؤشرات الحفظ في الترويسة
+  const [lastSavedAt, setLastSavedAt] = useState<Date | null>(null);
+  const [saveStatus, setSaveStatus] = useState<SaveStatus>('idle');
+  const [saveError, setSaveError] = useState<string | null>(null);
+
+  // الشهر المحدد (يبدأ افتراضياً بشهر 9 - سبتمبر)
   const [selectedMonth, setSelectedMonth] = useState<string>(getDefaultAppMonth);
   const [activeTab, setActiveTab] = useState<ActiveNavTab>('overview');
   const [activeTeacherId, setActiveTeacherId] = useState<string | null>(null);
 
+  // ١. التحميل أولاً: اقرأ البيانات من localStorage قبل أي كتابة
   useEffect(() => {
-    setIsHydrated(true);
-    const loaded = getInitialData();
-    setData(loaded);
+    try {
+      const loaded = loadDataFromStorage();
+      const finalData = loaded || createEmptyData();
+
+      setData(finalData);
+      dataRef.current = finalData;
+      setIsHydrated(true);
+      isHydratedRef.current = true;
+
+      if (finalData.updatedAt) {
+        setLastSavedAt(new Date(finalData.updatedAt));
+      } else {
+        setLastSavedAt(new Date());
+      }
+      setSaveStatus('saved');
+    } catch (err) {
+      console.error('فشل في تحميل البيانات الأولية:', err);
+      setIsHydrated(true);
+      isHydratedRef.current = true;
+      setSaveStatus('error');
+      setSaveError('تعذر قراءة البيانات من المتصفح');
+    }
   }, []);
 
-  const updateStateAndPersist = useCallback((updater: (prev: CenterData) => CenterData) => {
-    setData((prev) => {
-      const next = updater(prev);
-      saveData(next);
-      return next;
-    });
+  // دالة الحفظ المركزية والآمنة
+  const persistData = useCallback((nextData: CenterData, forceEmpty = false) => {
+    // ممنوع الحفظ طالما isHydrated تساوي false (Rule #1)
+    if (!isHydratedRef.current) {
+      console.warn('تم منع الحفظ: لا تزال عملية التحميل (hydration) جارية.');
+      return;
+    }
+
+    setSaveStatus('saving');
+    const result = saveDataToStorage(nextData, { forceEmpty });
+
+    if (result.success) {
+      setLastSavedAt(result.timestamp);
+      setSaveStatus('saved');
+      setSaveError(null);
+    } else {
+      setSaveStatus('error');
+      setSaveError(result.error || 'فشل حفظ البيانات في المتصفح');
+      console.error('فشل الحفظ:', result.error);
+    }
   }, []);
+
+  // دالة تحديث الحالة والحفظ فوراً مع منع الازدواجية
+  const updateAndPersist = useCallback(
+    (updater: (prev: CenterData) => CenterData, forceEmpty = false) => {
+      if (!isHydratedRef.current) return;
+
+      setData((prev) => {
+        const next = updater(prev);
+        dataRef.current = next;
+        // الحفظ الفوري المباشر بعد التعديل (Rule #3)
+        persistData(next, forceEmpty);
+        return next;
+      });
+    },
+    [persistData]
+  );
+
+  // Rule #3: الحفظ عند حدث visibilitychange و pagehide و beforeunload
+  useEffect(() => {
+    if (!isHydrated) return;
+
+    const handleFlush = () => {
+      if (isHydratedRef.current && dataRef.current) {
+        saveDataToStorage(dataRef.current);
+      }
+    };
+
+    const handleVisibilityChange = () => {
+      if (document.visibilityState === 'hidden') {
+        handleFlush();
+      }
+    };
+
+    window.addEventListener('visibilitychange', handleVisibilityChange);
+    window.addEventListener('pagehide', handleFlush);
+    window.addEventListener('beforeunload', handleFlush);
+
+    return () => {
+      window.removeEventListener('visibilitychange', handleVisibilityChange);
+      window.removeEventListener('pagehide', handleFlush);
+      window.removeEventListener('beforeunload', handleFlush);
+    };
+  }, [isHydrated]);
+
+  // مزامنة التغييرات بين النوافذ والتابات المختلفة تلقائياً
+  useEffect(() => {
+    if (!isHydrated) return;
+
+    const handleStorageEvent = (e: StorageEvent) => {
+      if (e.key === STORAGE_KEY && e.newValue) {
+        try {
+          const parsed = JSON.parse(e.newValue);
+          if (parsed && Array.isArray(parsed.teachers) && Array.isArray(parsed.students)) {
+            setData(parsed);
+            dataRef.current = parsed;
+            if (parsed.updatedAt) {
+              setLastSavedAt(new Date(parsed.updatedAt));
+            }
+          }
+        } catch {
+          // تجاهل الخطأ
+        }
+      }
+    };
+
+    window.addEventListener('storage', handleStorageEvent);
+    return () => window.removeEventListener('storage', handleStorageEvent);
+  }, [isHydrated]);
+
+  // إتاحة حفظ يدوي للمستخدمة
+  const forceSave = useCallback(() => {
+    if (isHydratedRef.current && dataRef.current) {
+      persistData(dataRef.current);
+    }
+  }, [persistData]);
 
   const openTeacherView = useCallback((teacherId: string) => {
     setActiveTeacherId(teacherId);
     setActiveTab('teacher');
   }, []);
 
-  // Teacher actions
+  // عمليات المدرسين
   const addTeacher = useCallback(
     (newTeacherData: Omit<Teacher, 'id'>): Teacher => {
       const newTeacher: Teacher = {
         ...newTeacherData,
         id: `teacher-${generateId()}`,
       };
-      updateStateAndPersist((prev) => ({
+      updateAndPersist((prev) => ({
         ...prev,
         teachers: [newTeacher, ...prev.teachers],
       }));
       return newTeacher;
     },
-    [updateStateAndPersist]
+    [updateAndPersist]
   );
 
   const updateTeacher = useCallback(
     (id: string, updates: Partial<Teacher>) => {
-      updateStateAndPersist((prev) => ({
+      updateAndPersist((prev) => ({
         ...prev,
         teachers: prev.teachers.map((t) => (t.id === id ? { ...t, ...updates } : t)),
       }));
     },
-    [updateStateAndPersist]
+    [updateAndPersist]
   );
 
   const deleteTeacher = useCallback(
     (id: string) => {
-      updateStateAndPersist((prev) => {
+      updateAndPersist((prev) => {
         const remainingTeachers = prev.teachers.filter((t) => t.id !== id);
         const remainingStudents = prev.students.filter((s) => s.teacherId !== id);
         const removedStudentIds = new Set(
@@ -144,10 +289,10 @@ export const CenterProvider: React.FC<{ children: React.ReactNode }> = ({ childr
         setActiveTab('overview');
       }
     },
-    [activeTeacherId, updateStateAndPersist]
+    [activeTeacherId, updateAndPersist]
   );
 
-  // Student actions
+  // عمليات الطلاب
   const addStudent = useCallback(
     (newStudentData: Omit<Student, 'id' | 'createdAt'>): Student => {
       const newStudent: Student = {
@@ -156,37 +301,37 @@ export const CenterProvider: React.FC<{ children: React.ReactNode }> = ({ childr
         monthlyFee: newStudentData.monthlyFee ?? getDefaultFeeForGrade(newStudentData.grade),
         createdAt: new Date().toISOString(),
       };
-      updateStateAndPersist((prev) => ({
+      updateAndPersist((prev) => ({
         ...prev,
         students: [newStudent, ...prev.students],
       }));
       return newStudent;
     },
-    [updateStateAndPersist]
+    [updateAndPersist]
   );
 
   const updateStudent = useCallback(
     (id: string, updates: Partial<Student>) => {
-      updateStateAndPersist((prev) => ({
+      updateAndPersist((prev) => ({
         ...prev,
         students: prev.students.map((s) => (s.id === id ? { ...s, ...updates } : s)),
       }));
     },
-    [updateStateAndPersist]
+    [updateAndPersist]
   );
 
   const deleteStudent = useCallback(
     (id: string) => {
-      updateStateAndPersist((prev) => ({
+      updateAndPersist((prev) => ({
         ...prev,
         students: prev.students.filter((s) => s.id !== id),
         payments: prev.payments.filter((p) => p.studentId !== id),
       }));
     },
-    [updateStateAndPersist]
+    [updateAndPersist]
   );
 
-  // Quick Payment status setter with automatic payment date
+  // عمليات المدفوعات السريعة
   const setPaymentStatus = useCallback(
     (
       studentId: string,
@@ -195,13 +340,12 @@ export const CenterProvider: React.FC<{ children: React.ReactNode }> = ({ childr
       amount?: number,
       paidAt?: string
     ) => {
-      updateStateAndPersist((prev) => {
+      updateAndPersist((prev) => {
         const student = prev.students.find((s) => s.id === studentId);
         const teacher = student
           ? prev.teachers.find((t) => t.id === student.teacherId)
           : undefined;
 
-        // Auto-calculate fee based on student's fee or grade rule
         const defaultFee = student
           ? student.monthlyFee ?? getDefaultFeeForGrade(student.grade)
           : teacher?.monthlyFee ?? 80;
@@ -253,13 +397,12 @@ export const CenterProvider: React.FC<{ children: React.ReactNode }> = ({ childr
         };
       });
     },
-    [updateStateAndPersist]
+    [updateAndPersist]
   );
 
-  // Dedicated Payment date editor
   const setPaymentDate = useCallback(
     (studentId: string, month: string, paidAt: string) => {
-      updateStateAndPersist((prev) => {
+      updateAndPersist((prev) => {
         const existingIndex = prev.payments.findIndex(
           (p) => p.studentId === studentId && p.month === month
         );
@@ -296,31 +439,38 @@ export const CenterProvider: React.FC<{ children: React.ReactNode }> = ({ childr
         }
       });
     },
-    [updateStateAndPersist]
+    [updateAndPersist]
   );
 
-  // Reset to empty state (البدء من الصفر)
+  // البدء من الصفر مع الحذف المؤكد
   const resetToEmpty = useCallback(() => {
-    const empty = createEmptyData();
-    saveData(empty);
+    const empty = clearAllStorageData();
+    dataRef.current = empty;
     setData(empty);
+    setLastSavedAt(new Date());
+    setSaveStatus('saved');
+    setSaveError(null);
     setActiveTeacherId(null);
     setActiveTab('overview');
   }, []);
 
-  // Reset to seed data
+  // إعادة تحميل الداتا التجريبية
   const resetToSeed = useCallback(() => {
-    const seed = createSeedData();
-    saveData(seed);
+    const seed = restoreSeedData();
+    dataRef.current = seed;
     setData(seed);
+    setLastSavedAt(new Date());
+    setSaveStatus('saved');
+    setSaveError(null);
     setActiveTeacherId(null);
     setActiveTab('overview');
   }, []);
 
-  // Month unlocking methods
-  const unlockedMonths = Array.isArray(data.unlockedMonths) && data.unlockedMonths.length > 0
-    ? data.unlockedMonths
-    : ['2026-08', '2026-09'];
+  // فتح وتفعيل الشهور
+  const unlockedMonths =
+    Array.isArray(data.unlockedMonths) && data.unlockedMonths.length > 0
+      ? data.unlockedMonths
+      : ['2026-08', '2026-09'];
 
   const isMonthUnlocked = useCallback(
     (month: string) => {
@@ -341,7 +491,7 @@ export const CenterProvider: React.FC<{ children: React.ReactNode }> = ({ childr
 
   const unlockMonth = useCallback(
     (month: string) => {
-      updateStateAndPersist((prev) => {
+      updateAndPersist((prev) => {
         const currentUnlocked =
           Array.isArray(prev.unlockedMonths) && prev.unlockedMonths.length > 0
             ? prev.unlockedMonths
@@ -349,7 +499,6 @@ export const CenterProvider: React.FC<{ children: React.ReactNode }> = ({ childr
 
         if (currentUnlocked.includes(month)) return prev;
 
-        // Clean out any stale payment records for this month so all students start as 'unpaid'
         const cleanPayments = prev.payments.filter((p) => p.month !== month);
 
         return {
@@ -360,13 +509,17 @@ export const CenterProvider: React.FC<{ children: React.ReactNode }> = ({ childr
       });
       setSelectedMonth(month);
     },
-    [updateStateAndPersist]
+    [updateAndPersist]
   );
 
-  const importData = useCallback((newData: CenterData) => {
-    saveData(newData);
-    setData(newData);
-  }, []);
+  const importData = useCallback(
+    (newData: CenterData) => {
+      persistData(newData, true);
+      dataRef.current = newData;
+      setData(newData);
+    },
+    [persistData]
+  );
 
   return (
     <CenterContext.Provider
@@ -380,6 +533,10 @@ export const CenterProvider: React.FC<{ children: React.ReactNode }> = ({ childr
         activeTeacherId,
         setActiveTeacherId,
         openTeacherView,
+        lastSavedAt,
+        saveStatus,
+        saveError,
+        forceSave,
         addTeacher,
         updateTeacher,
         deleteTeacher,

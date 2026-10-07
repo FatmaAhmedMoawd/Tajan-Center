@@ -7,7 +7,18 @@ import { StatsView } from './components/stats/StatsView';
 import { SettingsView } from './components/settings/SettingsView';
 
 const MainContent: React.FC = () => {
-  const { activeTab, activeTeacherId } = useCenter();
+  const { activeTab, activeTeacherId, isHydrated } = useCenter();
+
+  if (!isHydrated) {
+    return (
+      <div className="flex flex-col items-center justify-center min-h-[50vh] space-y-3">
+        <div className="w-8 h-8 border-3 border-indigo-200 border-t-indigo-600 rounded-full animate-spin" />
+        <p className="text-xs sm:text-sm font-semibold text-slate-600">
+          جارٍ استرجاع بيانات السنتر من المتصفح...
+        </p>
+      </div>
+    );
+  }
 
   return (
     <main className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-6 sm:py-8">
